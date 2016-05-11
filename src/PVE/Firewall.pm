@@ -3,7 +3,7 @@ package PVE::Firewall;
 use warnings;
 use strict;
 use POSIX;
-use Data::Dumper;
+use JSON;
 use Digest::SHA;
 use Socket qw(AF_INET6 inet_ntop inet_pton);
 use PVE::INotify;
@@ -19,6 +19,17 @@ use IO::File;
 use Net::IP;
 use PVE::Tools qw(run_command lock_file dir_glob_foreach);
 use Encode;
+
+use constant {
+    NFT_TYPE_IPADDR => 7,
+    NFT_TYPE_IP6ADDR => 8,
+
+    NFT_SET_FLAG_CONSTANT => 0x02,
+    NFT_SET_FLAG_INTERVAL => 0x04,
+    NFT_SET_FLAG_TIMEOUT  => 0x10,
+
+    NFT_SET_ELEM_INTERVAL_END => 0x1,
+};
 
 my $hostfw_conf_filename = "/etc/pve/local/host.fw";
 my $pvefw_conf_dir = "/etc/pve/firewall";
@@ -535,47 +546,45 @@ my $FWACCEPTMARK_OFF = "0x00000000/0x80000000";
 my $pve_std_chains = {};
 $pve_std_chains->{4} = {
     'PVEFW-SET-ACCEPT-MARK' => [
-	"-j MARK --set-mark $FWACCEPTMARK_ON",
+	'mark set (mark | 0x80000000)',
     ],
     'PVEFW-DropBroadcast' => [
 	# same as shorewall 'Broadcast'
-	# simply DROP BROADCAST/MULTICAST/ANYCAST
+	# simply DROP BROADCAST/MULTICAST/ANYCAST (FIXME: anycast with nftables?)
 	# we can use this to reduce logging
-	{ action => 'DROP', dsttype => 'BROADCAST' },
-	{ action => 'DROP', dsttype => 'MULTICAST' },
-	{ action => 'DROP', dsttype => 'ANYCAST' },
-	{ action => 'DROP', dest => '224.0.0.0/4' },
+	'pkttype {broadcast,multicast} drop',
+	'ip daddr 224.0.0.0/4 drop',
     ],
     'PVEFW-reject' => [
 	# same as shorewall 'reject'
-	{ action => 'DROP', dsttype => 'BROADCAST' },
-	{ action => 'DROP', source => '224.0.0.0/4' },
-	{ action => 'DROP', proto => 'icmp' },
-	"-p tcp -j REJECT --reject-with tcp-reset",
-	"-p udp -j REJECT --reject-with icmp-port-unreachable",
-	"-p icmp -j REJECT --reject-with icmp-host-unreachable",
-	"-j REJECT --reject-with icmp-host-prohibited",
+	'pkttype broadcast drop',
+	'ip saddr 224.0.0.0/4 drop',
+	'ip protocol icmp drop',
+	'ip protocol tcp reject with tcp reset',
+	'ip protocol udp reject with icmp type port-unreachable',
+	#'ip protocol icmp reject with icmp type host-unreachable',
+	'reject with icmp type host-prohibited',
     ],
     'PVEFW-Drop' => [
 	# same as shorewall 'Drop', which is equal to DROP,
 	# but REJECT/DROP some packages to reduce logging,
 	# and ACCEPT critical ICMP types
-	{ action => 'PVEFW-reject',  proto => 'tcp', dport => '43' }, # REJECT 'auth'
+	'tcp dport 43 goto PVEFW-reject', # REJECT 'auth'
 	# we are not interested in BROADCAST/MULTICAST/ANYCAST
 	{ action => 'PVEFW-DropBroadcast' },
 	# ACCEPT critical ICMP types
-	{ action => 'ACCEPT', proto => 'icmp', dport => 'fragmentation-needed' },
-	{ action => 'ACCEPT', proto => 'icmp', dport => 'time-exceeded' },
+	'ip protocol icmp icmp type 3 icmp code 4 accept', # fragmentation-needed
+	'ip protocol icmp icmp type 11 accept', # time-exceeded
 	# Drop packets with INVALID state
-	"-m conntrack --ctstate INVALID -j DROP",
+	'ct state invalid drop',
 	# Drop Microsoft SMB noise
-	{ action => 'DROP', proto => 'udp', dport => '135,445', nbdport => 2 },
+	{ action => 'DROP', proto => 'udp', dport => '135,445' },
 	{ action => 'DROP', proto => 'udp', dport => '137:139'},
-	{ action => 'DROP', proto => 'udp', dport => '1024:65535', sport => 137 },
-	{ action => 'DROP', proto => 'tcp', dport => '135,139,445', nbdport => 3 },
+	{ action => 'DROP', proto => 'udp', dport => '1024:65535' },
+	{ action => 'DROP', proto => 'tcp', dport => '135,139,445' },
 	{ action => 'DROP', proto => 'udp', dport => 1900 }, # UPnP
 	# Drop new/NotSyn traffic so that it doesn't get logged
-	"-p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j DROP",
+	'(tcp flags & (fin|syn|rst|ack)) != syn drop',
 	# Drop DNS replies
 	{ action => 'DROP', proto => 'udp', sport => 53 },
     ],
@@ -587,192 +596,189 @@ $pve_std_chains->{4} = {
 	# we are not interested in BROADCAST/MULTICAST/ANYCAST
 	{ action => 'PVEFW-DropBroadcast' },
 	# ACCEPT critical ICMP types
-	{ action => 'ACCEPT', proto => 'icmp', dport => 'fragmentation-needed' },
-	{ action => 'ACCEPT', proto => 'icmp', dport => 'time-exceeded' },
+	#{ action => 'ACCEPT', proto => 'icmp', dport => 'fragmentation-needed' },
+	#{ action => 'ACCEPT', proto => 'icmp', dport => 'time-exceeded' },
+	'ip protocol icmp icmp type 3 icmp code 4 accept',
+	'ip protocol icmp icmp type 11 accept',
 	# Drop packets with INVALID state
-	"-m conntrack --ctstate INVALID -j DROP",
+	'ct state invalid drop',
 	# Drop Microsoft SMB noise
-	{ action => 'PVEFW-reject', proto => 'udp', dport => '135,445', nbdport => 2 },
+	{ action => 'PVEFW-reject', proto => 'udp', dport => '135,445' },
 	{ action => 'PVEFW-reject', proto => 'udp', dport => '137:139'},
-	{ action => 'PVEFW-reject', proto => 'udp', dport => '1024:65535', sport => 137 },
-	{ action => 'PVEFW-reject', proto => 'tcp', dport => '135,139,445', nbdport => 3 },
+	{ action => 'PVEFW-reject', proto => 'udp', dport => '1024:65535' },
+	{ action => 'PVEFW-reject', proto => 'tcp', dport => '135,139,445' },
 	{ action => 'DROP', proto => 'udp', dport => 1900 }, # UPnP
 	# Drop new/NotSyn traffic so that it doesn't get logged
-	"-p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j DROP",
+	'(tcp flags & (fin|syn|rst|ack)) != syn drop',
 	# Drop DNS replies
 	{ action => 'DROP', proto => 'udp', sport => 53 },
     ],
     'PVEFW-tcpflags' => [
 	# same as shorewall tcpflags action.
 	# Packets arriving on this interface are checked for som illegal combinations of TCP flags
-	"-p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,PSH,URG -g PVEFW-logflags",
-	"-p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG NONE -g PVEFW-logflags",
-	"-p tcp -m tcp --tcp-flags SYN,RST SYN,RST -g PVEFW-logflags",
-	"-p tcp -m tcp --tcp-flags FIN,SYN FIN,SYN -g PVEFW-logflags",
-	"-p tcp -m tcp --sport 0 --tcp-flags FIN,SYN,RST,ACK SYN -g PVEFW-logflags",
+	'(tcp flags & (fin|syn|rst|psh|ack|urg)) == (fin|psh|urg) goto PVEFW-logflags',
+	'(tcp flags & (fin|syn|rst|psh|ack|urg)) == 0 goto PVEFW-logflags',
+	'(tcp flags & (syn|rst)) == (syn|rst) goto PVEFW-logflags',
+	'(tcp flags & (fin|syn)) == (fin|syn) goto PVEFW-logflags',
+	'tcp sport 0 (tcp flags & (fin|syn|rst|ack)) == syn goto PVEFW-logflags',
     ],
     'PVEFW-smurfs' => [
 	# same as shorewall smurfs action
 	# Filter packets for smurfs (packets with a broadcast address as the source).
-	"-s 0.0.0.0/32 -j RETURN", # allow DHCP
-	"-m addrtype --src-type BROADCAST -g PVEFW-smurflog",
-	"-s 224.0.0.0/4 -g PVEFW-smurflog",
+	'ip saddr 0.0.0.0/32 return', # allow DHCP
+	'pkttype broadcast goto PVEFW-smurflog',
+	'ip saddr 224.0.0.0/4 goto PVEFW-smurflog',
     ],
 };
 
 $pve_std_chains->{6} = {
     'PVEFW-SET-ACCEPT-MARK' => [
-        "-j MARK --set-mark $FWACCEPTMARK_ON",
+	'mark set (mark | 0x80000000)',
     ],
     'PVEFW-DropBroadcast' => [
-        # same as shorewall 'Broadcast'
-        # simply DROP BROADCAST/MULTICAST/ANYCAST
-        # we can use this to reduce logging
-        #{ action => 'DROP', dsttype => 'BROADCAST' }, #no broadcast in ipv6
-	# ipv6 addrtype does not work with kernel 2.6.32
-	#{ action => 'DROP', dsttype => 'MULTICAST' },
-        #{ action => 'DROP', dsttype => 'ANYCAST' },
-        { action => 'DROP', dest => 'ff00::/8' },
-        #{ action => 'DROP', dest => '224.0.0.0/4' },
+	# same as shorewall 'Broadcast'
+	# simply DROP BROADCAST/MULTICAST/ANYCAST
+	# we can use this to reduce logging
+	'pkttype {broadcast,multicast} drop',
     ],
     'PVEFW-reject' => [
         # same as shorewall 'reject'
-        #{ action => 'DROP', dsttype => 'BROADCAST' },
-        #{ action => 'DROP', source => '224.0.0.0/4' },
 	{ action => 'DROP', proto => 'icmpv6' },
-        "-p tcp -j REJECT --reject-with tcp-reset",
-        #"-p udp -j REJECT --reject-with icmp-port-unreachable",
-        #"-p icmp -j REJECT --reject-with icmp-host-unreachable",
-        #"-j REJECT --reject-with icmp-host-prohibited",
+	'ip nexthdr tcp reject with tcp reset',
+	'ip nexthdr udp reject with icmp6 type port-unreachable',
+	'reject with icmp6 type host-prohibited',
     ],
     'PVEFW-Drop' => [
-        # same as shorewall 'Drop', which is equal to DROP,
-        # but REJECT/DROP some packages to reduce logging,
-        # and ACCEPT critical ICMP types
-	{ action => 'PVEFW-reject', proto => 'tcp', dport => '43' }, # REJECT 'auth'
-        # we are not interested in BROADCAST/MULTICAST/ANYCAST
-        { action => 'PVEFW-DropBroadcast' },
-        # ACCEPT critical ICMP types
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'destination-unreachable' },
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'time-exceeded' },
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'packet-too-big' },
-
-        # Drop packets with INVALID state
-        "-m conntrack --ctstate INVALID -j DROP",
-        # Drop Microsoft SMB noise
-	{ action => 'DROP', proto => 'udp', dport => '135,445', nbdport => 2 },
+	# same as shorewall 'Drop', which is equal to DROP,
+	# but REJECT/DROP some packages to reduce logging,
+	# and ACCEPT critical ICMP types
+	'tcp dport 43 goto PVEFW-reject', # REJECT 'auth'
+	# we are not interested in BROADCAST/MULTICAST/ANYCAST
+	{ action => 'PVEFW-DropBroadcast' },
+	# ACCEPT critical ICMP types
+	'ip6 nexthdr icmpv6 icmpv6 type 1 accept', # destination unreachable
+	'ip6 nexthdr icmpv6 icmpv6 type 3 accept', # time-exceeded
+	'ip6 nexthdr icmpv6 icmpv6 type 2 accept', # packet-too-big
+	# Drop packets with INVALID state
+	'ct state invalid drop',
+	# Drop Microsoft SMB noise
+	{ action => 'DROP', proto => 'udp', dport => '135,445' },
 	{ action => 'DROP', proto => 'udp', dport => '137:139'},
-	{ action => 'DROP', proto => 'udp', dport => '1024:65535', sport => 137 },
-	{ action => 'DROP', proto => 'tcp', dport => '135,139,445', nbdport => 3 },
+	{ action => 'DROP', proto => 'udp', dport => '1024:65535' },
+	{ action => 'DROP', proto => 'tcp', dport => '135,139,445' },
 	{ action => 'DROP', proto => 'udp', dport => 1900 }, # UPnP
-        # Drop new/NotSyn traffic so that it doesn't get logged
-        "-p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j DROP",
-        # Drop DNS replies
+	# Drop new/NotSyn traffic so that it doesn't get logged
+	'(tcp flags & (fin|syn|rst|ack)) != syn drop',
+	# Drop DNS replies
 	{ action => 'DROP', proto => 'udp', sport => 53 },
     ],
     'PVEFW-Reject' => [
-        # same as shorewall 'Reject', which is equal to Reject,
-        # but REJECT/DROP some packages to reduce logging,
-        # and ACCEPT critical ICMP types
-        { action => 'PVEFW-reject',  proto => 'tcp', dport => '43' }, # REJECT 'auth'
-        # we are not interested in BROADCAST/MULTICAST/ANYCAST
-        { action => 'PVEFW-DropBroadcast' },
-        # ACCEPT critical ICMP types
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'destination-unreachable' },
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'time-exceeded' },
-        { action => 'ACCEPT', proto => 'icmpv6', dport => 'packet-too-big' },
-
-        # Drop packets with INVALID state
-        "-m conntrack --ctstate INVALID -j DROP",
-        # Drop Microsoft SMB noise
-        { action => 'PVEFW-reject', proto => 'udp', dport => '135,445', nbdport => 2 },
-        { action => 'PVEFW-reject', proto => 'udp', dport => '137:139'},
-        { action => 'PVEFW-reject', proto => 'udp', dport => '1024:65535', sport => 137 },
-        { action => 'PVEFW-reject', proto => 'tcp', dport => '135,139,445', nbdport => 3 },
-        { action => 'DROP', proto => 'udp', dport => 1900 }, # UPnP
-        # Drop new/NotSyn traffic so that it doesn't get logged
-        "-p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -j DROP",
-        # Drop DNS replies
-        { action => 'DROP', proto => 'udp', sport => 53 },
+	# same as shorewall 'Reject', which is equal to Reject,
+	# but REJECT/DROP some packages to reduce logging,
+	# and ACCEPT critical ICMP types
+	{ action => 'PVEFW-reject',  proto => 'tcp', dport => '43' }, # REJECT 'auth'
+	# we are not interested in BROADCAST/MULTICAST/ANYCAST
+	{ action => 'PVEFW-DropBroadcast' },
+	# ACCEPT critical ICMP types
+	'ip6 nexthdr icmpv6 icmpv6 type 1 accept', # destination unreachable
+	'ip6 nexthdr icmpv6 icmpv6 type 3 accept', # time-exceeded
+	'ip6 nexthdr icmpv6 icmpv6 type 2 accept', # packet-too-big
+	# Drop packets with INVALID state
+	'ct state invalid drop',
+	# Drop Microsoft SMB noise
+	{ action => 'PVEFW-reject', proto => 'udp', dport => '135,445' },
+	{ action => 'PVEFW-reject', proto => 'udp', dport => '137:139'},
+	{ action => 'PVEFW-reject', proto => 'udp', dport => '1024:65535' },
+	{ action => 'PVEFW-reject', proto => 'tcp', dport => '135,139,445' },
+	{ action => 'DROP', proto => 'udp', dport => 1900 }, # UPnP
+	# Drop new/NotSyn traffic so that it doesn't get logged
+	'(tcp flags & (fin|syn|rst|ack)) != syn drop',
+	# Drop DNS replies
+	{ action => 'DROP', proto => 'udp', sport => 53 },
     ],
     'PVEFW-tcpflags' => [
-        # same as shorewall tcpflags action.
-        # Packets arriving on this interface are checked for som illegal combinations of TCP flags
-        "-p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,PSH,URG -g PVEFW-logflags",
-        "-p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG NONE -g PVEFW-logflags",
-        "-p tcp -m tcp --tcp-flags SYN,RST SYN,RST -g PVEFW-logflags",
-        "-p tcp -m tcp --tcp-flags FIN,SYN FIN,SYN -g PVEFW-logflags",
-        "-p tcp -m tcp --sport 0 --tcp-flags FIN,SYN,RST,ACK SYN -g PVEFW-logflags",
+	# same as shorewall tcpflags action.
+	# Packets arriving on this interface are checked for som illegal combinations of TCP flags
+	'(tcp flags & (fin|syn|rst|psh|ack|urg)) == (fin|psh|urg) goto PVEFW-logflags',
+	'(tcp flags & (fin|syn|rst|psh|ack|urg)) == 0 goto PVEFW-logflags',
+	'(tcp flags & (syn|rst)) == (syn|rst) goto PVEFW-logflags',
+	'(tcp flags & (fin|syn)) == (fin|syn) goto PVEFW-logflags',
+	'tcp sport 0 (tcp flags & (fin|syn|rst|ack)) == syn goto PVEFW-logflags',
     ],
 };
 
-# iptables -p icmp -h
 my $icmp_type_names = {
     any => 1,
-    'echo-reply' => 1,
-    'destination-unreachable' => 1,
-    'network-unreachable' => 1,
-    'host-unreachable' => 1,
-    'protocol-unreachable' => 1,
-    'port-unreachable' => 1,
-    'fragmentation-needed' => 1,
-    'source-route-failed' => 1,
-    'network-unknown' => 1,
-    'host-unknown' => 1,
-    'network-prohibited' => 1,
-    'host-prohibited' => 1,
-    'TOS-network-unreachable' => 1,
-    'TOS-host-unreachable' => 1,
-    'communication-prohibited' => 1,
-    'host-precedence-violation' => 1,
-    'precedence-cutoff' => 1,
-    'source-quench' => 1,
-    'redirect' => 1,
-    'network-redirect' => 1,
-    'host-redirect' => 1,
-    'TOS-network-redirect' => 1,
-    'TOS-host-redirect' => 1,
-    'echo-request' => 1,
-    'router-advertisement' => 1,
-    'router-solicitation' => 1,
-    'time-exceeded' => 1,
-    'ttl-zero-during-transit' => 1,
-    'ttl-zero-during-reassembly' => 1,
-    'parameter-problem' => 1,
-    'ip-header-bad' => 1,
-    'required-option-missing' => 1,
-    'timestamp-request' => 1,
-    'timestamp-reply' => 1,
-    'address-mask-request' => 1,
-    'address-mask-reply' => 1,
-};
 
-# ip6tables -p icmpv6 -h
+    'echo-request' => [8],
+    'echo-reply' => [0],
+    'pong' => [0],
+    'destination-unreachable' => [3],
+    'network-unreachable' => [3, 0],
+    'host-unreachable' => [3, 1],
+    'protocol-unreachable' => [3, 2],
+    'port-unreachable' => [3, 3],
+    'fragmentation-needed' => [3, 4],
+    'source-route-failed' => [3, 5],
+    'network-unknown' => [3, 6],
+    'host-unknown' => [3, 7],
+    'network-prohibited' => [3, 9],
+    'host-prohibited' => [3, 10],
+    'TOS-network-unreachable' => [3, 11],
+    'TOS-host-unreachable' => [3, 12],
+    'communication-prohibited' => [3, 13],
+    'host-precedence-violation' => [3, 14],
+    'precedence-cutoff' => [3, 15],
+    'source-quench' => [4],
+    'redirect' => [5],
+    'network-redirect' => [5, 0],
+    'host-redirect' => [5, 1],
+    'TOS-network-redirect' => [5, 2],
+    'TOS-host-redirect' => [5, 3],
+    'router-advertisement' => [9],
+    'router-solicitation' => [10],
+    'time-exceeded' => [11],
+    'ttl-exceeded' => [11],
+    'ttl-zero-during-transit' => [11, 0],
+    'ttl-zero-during-reassembly' => [11, 1],
+    'parameter-problem' => [12],
+    'ip-header-bad' => [12, 0],
+    'required-option-missing' => [12, 1],
+    'timestamp-request' => [13],
+    'timestamp-reply' => [14],
+    'address-mask-request' => [17],
+    'address-mask-reply' => [18],
+};
 
 my $icmpv6_type_names = {
     'any' => 1,
-    'destination-unreachable' => 1,
-    'no-route' => 1,
-    'communication-prohibited' => 1,
-    'address-unreachable' => 1,
-    'port-unreachable' => 1,
-    'packet-too-big' => 1,
-    'time-exceeded' => 1,
-    'ttl-zero-during-transit' => 1,
-    'ttl-zero-during-reassembly' => 1,
-    'parameter-problem' => 1,
-    'bad-header' => 1,
-    'unknown-header-type' => 1,
-    'unknown-option' => 1,
-    'echo-request' => 1,
-    'echo-reply' => 1,
-    'router-solicitation' => 1,
-    'router-advertisement' => 1,
-    'neighbor-solicitation' => 1,
-    'neighbour-solicitation' => 1,
-    'neighbor-advertisement' => 1,
-    'neighbour-advertisement' => 1,
-    'redirect' => 1,
+    'destination-unreachable' => [1],
+    'no-route' => [1, 0],
+    'communication-prohibited' => [1, 1],
+    'beyond-scope' => [1, 2],
+    'address-unreachable' => [1, 3],
+    'port-unreachable' => [1, 4],
+    'failed-policy' => [1, 5],
+    'packet-too-big' => [2],
+    'time-exceeded' => [3],
+    'ttl-exceeded' => [3],
+    'ttl-zero-during-transit' => [3, 0],
+    'ttl-zero-during-reassembly' => [3, 1],
+    'parameter-problem' => [4],
+    'bad-header' => [4, 0],
+    'unknown-header-type' => [4, 1],
+    'unknown-option' => [4, 2],
+    'echo-request' => [128],
+    'ping' => [128],
+    'echo-reply' => [129],
+    'pong' => [129],
+    'router-solicitation' => [133],
+    'router-advertisement' => [134],
+    'neighbor-solicitation' => 135],
+    'neighbour-solicitation' => [135],
+    'neighbor-advertisement' => [136],
+    'neighbour-advertisement' => [136],
+    'redirect' => [137],
 };
 
 sub init_firewall_macros {
@@ -937,9 +943,9 @@ sub local_network {
 # and we use '_swap' suffix for atomic update, 
 # for example PVEFW-${VMID}-${ipset_name}_swap
 
-my $max_iptables_ipset_name_length = 31 - length("PVEFW-") - length("_swap");
+my $max_nftables_ipset_name_length = 15 - length("PVEFW-");
 
-sub compute_ipset_chain_name {
+sub compute_ipset_name {
     my ($vmid, $ipset_name, $ipversion) = @_;
 
     $vmid = 0 if !defined($vmid);
@@ -993,6 +999,7 @@ sub parse_address_list {
 	$ipversion = $new_ipversion;
     }
 
+    # FIXME: nftables: just add {} around the list and it should work anywhere
     die "you can't use a range in a list\n" if $iprange && $count > 1;
 
     return $ipversion;
@@ -1007,7 +1014,7 @@ sub parse_port_name_number_or_range {
 
     foreach my $item (split(/,/, $str)) {
 	$count++;
-	if ($item =~ m/^(\d+):(\d+)$/) {
+	if ($item =~ m/^(\d+)[:-](\d+)$/) {
 	    my ($port1, $port2) = ($1, $2);
 	    die "invalid port '$port1'\n" if $port1 > 65535;
 	    die "invalid port '$port2'\n" if $port2 > 65535;
@@ -1025,7 +1032,7 @@ sub parse_port_name_number_or_range {
 	}
     }
 
-    die "ICPM ports not allowed in port range\n" if $icmp_port && $count > 1;
+    die "ICMP ports not allowed in port range\n" if $icmp_port && $count > 1;
 
     return $count;
 }
@@ -1245,7 +1252,7 @@ our $vm_option_properties = {
 
 my $addr_list_descr = "This can refer to a single IP address, an IP set ('+ipsetname') or an IP alias definition. You can also specify an address range like '20.34.101.207-201.3.9.99', or a list of IP addresses and networks (entries are separated by comma). Please do not mix IPv4 and IPv6 addresses inside such lists.";
 
-my $port_descr = "You can use service names or simple numbers (0-65535), as defined in '/etc/services'. Port ranges can be specified with '\\d+:\\d+', for example '80:85', and you can use comma separated list to match several ports or ranges.";
+my $port_descr = "You can use service names or simple numbers (0-65535), as defined in '/etc/services'. Port ranges can be specified with '\\d+:\\d+' or '\\d+-\\d+', for example '80:85' or '80-85', and you can use comma separated list to match several ports or ranges.";
 
 my $rule_properties = {
     pos => {
@@ -1643,85 +1650,170 @@ sub enable_bridge_firewall {
     $bridge_firewall_enabled = 1;
 }
 
-my $rule_format = "%-15s %-30s %-30s %-15s %-15s %-15s\n";
-
-sub iptables_restore_cmdlist {
+sub nftables_restore_cmdlist {
     my ($cmdlist) = @_;
-
-    run_command("/sbin/iptables-restore -n", input => $cmdlist, errmsg => "iptables_restore_cmdlist");
+    run_command("/usr/sbin/nft -f /dev/stdin", input => $cmdlist, errmsg => "nftables_restore_cmdlist");
 }
 
-sub ip6tables_restore_cmdlist {
+sub nfset_restore_cmdlist {
     my ($cmdlist) = @_;
-
-    run_command("/sbin/ip6tables-restore -n", input => $cmdlist, errmsg => "iptables_restore_cmdlist");
+    run_command("/usr/sbin/nft -f /dev/stdin", input => $cmdlist, errmsg => "nfset_restore_cmdlist");
 }
 
-sub ipset_restore_cmdlist {
-    my ($cmdlist) = @_;
-
-    run_command("/sbin/ipset restore", input => $cmdlist, errmsg => "ipset_restore_cmdlist");
+sub decode_nft_set_ipv4 {
+    my ($reg) = @_;
+    my $len = $reg->{len};
+    die "bad nft set element length\n" if !$len || $len != 4;
+    my $data0 = $reg->{data0};
+    die "missing data0 field in ipv4 nft set element\n" if !defined($data0);
+    return pack('N', hex($data0));
 }
 
-sub iptables_get_chains {
-    my ($iptablescmd) = @_;
+sub decode_nft_set_ipv6 {
+    my ($reg) = @_;
+    my $len = $reg->{len};
+    die "bad nft set element length\n" if !$len || $len != 16;
+    my $data0 = $reg->{data0};
+    my $data1 = $reg->{data1};
+    my $data2 = $reg->{data2};
+    my $data3 = $reg->{data3};
+    die "missing data0 field in ipv4 nft set element\n" if !defined($data0);
+    die "missing data1 field in ipv4 nft set element\n" if !defined($data1);
+    die "missing data2 field in ipv4 nft set element\n" if !defined($data2);
+    die "missing data3 field in ipv4 nft set element\n" if !defined($data3);
+    return pack('NNNN', hex($data0), hex($data1), hex($data2), hex($data3));
+}
 
-    $iptablescmd = "iptables" if !$iptablescmd;
+# 'list' sets are just lists of packed IP addresses
+# 'interval' sets are a sorted array of [first,last_plus_one) entries.
+sub decode_nft_set {
+    my ($elements, $type, $flags) = @_;
 
-    my $res = {};
+    my $data = [];
 
-    # check what chains we want to track
-    my $is_pvefw_chain = sub {
-	my $name = shift;
+    my $previous;
 
-	return 1 if $name =~ m/^PVEFW-\S+$/;
+    if ($type == NFT_TYPE_IPADDR) {
+	$previous = pack('NNNN', 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff);
+    } elsif ($type == NFT_TYPE_IP6ADDR) {
+	$previous = pack('N', 0xffffffff);
+    } else {
+	die "invalid nft set element type: $type\n";
+    }
 
-	return 1 if $name =~ m/^tap\d+i\d+-(?:IN|OUT)$/;
+    foreach my $e (@$elements) {
+	my $element_flags = $e->{flags}||0;
+	my $key = $e->{key};
+	die "unsupported set data (no 'key')\n" if !$key;
+	my $reg = $key->{reg};
+	die "unsupported set data (no 'reg')\n" if !$reg;
+	my $regtype = $reg->{type} || '';
+	die "unsupported set data (not a 'value')\n" if $regtype ne "value";
 
-	return 1 if $name =~ m/^veth\d+i\d+-(?:IN|OUT)$/;
-
-	return 1 if $name =~ m/^fwbr\d+(v\d+)?-(?:FW|IN|OUT|IPS)$/;
-	return 1 if $name =~ m/^GROUP-(?:$security_group_name_pattern)-(?:IN|OUT)$/;
-
-	return undef;
-    };
-
-    my $table = '';
-
-    my $hooks = {};
-
-    my $parser = sub {
-	my $line = shift;
-
-	return if $line =~ m/^#/;
-	return if $line =~ m/^\s*$/;
-
-	if ($line =~ m/^\*(\S+)$/) {
-	    $table = $1;
-	    return;
+	my $entry;
+	if ($type == NFT_TYPE_IPADDR) {
+	    $entry = decode_nft_set_ipv4($reg);
+	} elsif ($type == NFT_TYPE_IP6ADDR) {
+	    $entry = decode_nft_set_ipv6($reg);
 	}
 
-	return if $table ne 'filter';
-
-	if ($line =~ m/^:(\S+)\s/) {
-	    my $chain = $1;
-	    return if !&$is_pvefw_chain($chain);
-	    $res->{$chain} = "unknown";
-	} elsif ($line =~ m/^-A\s+(\S+)\s.*--comment\s+\"PVESIG:(\S+)\"/) {
-	    my ($chain, $sig) = ($1, $2);
-	    return if !&$is_pvefw_chain($chain);
-	    $res->{$chain} = $sig;
-	} elsif ($line =~ m/^-A\s+(INPUT|OUTPUT|FORWARD)\s+-j\s+PVEFW-\1$/) {
-	    $hooks->{$1} = 1;
+	if ($flags & NFT_SET_FLAG_INTERVAL) {
+	    if ($flags & NFT_SET_ELEM_INTERVAL_END) {
+		$previous = $entry;
+	    } else {
+		push @$data, [$entry, $previous];
+	    }
 	} else {
-	    # simply ignore the rest
-	    return;
+	    push @$data, $entry;
 	}
+    }
+}
+
+sub read_nftables {
+    my $str = '';
+
+    # the 'netdev' tables are shown as 'unknown' so we don't look through the
+    # tables at all and only check the chains.
+    run_command(['/usr/sbin/nft', 'export', 'json'],
+                outfunc => sub { $str .= shift });
+    my $data = from_json($str, {utf8 => 1});
+
+    my $netdev_filter_chains = {};
+    my $ip_filter_chains = {}
+    my $ip6_filter_chains = {};
+    my $ip_filter_sets = {};
+    my $ip6_filter_sets = {};
+    my $nft = {
+	netdev => {
+	    filter => {
+		chains => $netdev_filter_chains
+	    }
+	},
+	ip => {
+	    filter => {
+		sets => $ip_filter_sets,
+		chains => $ip_filter_chains
+	    }
+	},
+	ip6 => {
+	    filter => {
+		sets => $ip6_filter_sets,
+		chains => $ip6_filter_chains
+	    }
+	},
     };
 
-    run_command("/sbin/$iptablescmd-save", outfunc => $parser);
+    # turn into [ table { chain { ... } } ] format
+    $nftables = $data->{nftables};
+    foreach my $entry (@$nftables) {
+	if (my $chain = $entry->{chain}) {
+	    my $type = $chain->{type} || '';
+	    next if $type ne 'filter'; # we only deal with filter chains
 
-    return wantarray ? ($res, $hooks) : $res;
+	    my $family = $chain->{family};
+	    my $table = $chain->{table};
+	    my $name = $chain->{name}
+	    my $hook = $chain->{hooknum}; # not actually a number
+	    my $device = $chain->{device};
+
+	    if ($device && $name && $hook &&
+		$hook eq 'ingress' &&
+		$name eq $device &&
+		$device =~ /^(veth|tap)\d+i\d+$/)
+	    {
+		$family = 'netdev'; # shows as 'unknown'
+	    } elsif ($name !~ /^(?:PVEFW-|GROUP-\w+-(?:IN|OUT)$|(?:veth|tap)\d+i\d+(?:-IN)?$)/) {
+		next; # not a PVEFW chain
+	    }
+	    $nft->{$family}->{$table}->{chains}->{$name} = {
+		family => $family,
+		tables => $table,
+		hook => $hook,
+		policy => $chain->{policy},
+		rules => [],
+	    };
+	} elsif (my $set = $entry->{set}) {
+	    my $family = $set->{family};
+	    my $table = $set->{table};
+	    my $name = $set->{name}
+	    my $flags = $set->{flags}//0;
+	    my $type = $set->{key_type}//-1;
+
+	    if ($name =~ /^ipfilter-/) {
+		$family = 'netdev'; # shows as 'unknown'
+	    }
+
+	    $nft->{$family}->{$table}->{sets}->{$name} = {
+		family => $family,
+		table => $table,
+		flags => $flags,
+		type => $type,
+		elements => decode_nft_set($set->{set_elem}, $type, $flags),
+	    };
+	}
+    }
+
+    return $data->{nftables};
 }
 
 sub iptables_chain_digest {
@@ -1797,10 +1889,10 @@ sub ruleset_generate_cmdstr {
 	    if ($source =~ m/^\+(${ipset_name_pattern})$/) {
 		my $name = $1;
 		if ($fw_conf && $fw_conf->{ipset}->{$name}) {
-		    my $ipset_chain = compute_ipset_chain_name($fw_conf->{vmid}, $name, $ipversion);
+		    my $ipset_chain = compute_ipset_name($fw_conf->{vmid}, $name, $ipversion);
 		    push @cmd, "-m set --match-set ${ipset_chain} src";
 		} elsif ($cluster_conf && $cluster_conf->{ipset}->{$name}) {
-		    my $ipset_chain = compute_ipset_chain_name(0, $name, $ipversion);
+		    my $ipset_chain = compute_ipset_name(0, $name, $ipversion);
 		    push @cmd, "-m set --match-set ${ipset_chain} src";
 		} else {
 		    die "no such ipset '$name'\n";
@@ -1826,10 +1918,10 @@ sub ruleset_generate_cmdstr {
 	    if ($dest =~ m/^\+(${ipset_name_pattern})$/) {
 		my $name = $1;
 		if ($fw_conf && $fw_conf->{ipset}->{$name}) {
-		    my $ipset_chain = compute_ipset_chain_name($fw_conf->{vmid}, $name, $ipversion);
+		    my $ipset_chain = compute_ipset_name($fw_conf->{vmid}, $name, $ipversion);
 		    push @cmd, "-m set --match-set ${ipset_chain} dst";
 		} elsif ($cluster_conf && $cluster_conf->{ipset}->{$name}) {
-		    my $ipset_chain = compute_ipset_chain_name(0, $name, $ipversion);
+		    my $ipset_chain = compute_ipset_name(0, $name, $ipversion);
 		    push @cmd, "-m set --match-set ${ipset_chain} dst";
 		} else {
 		    die "no such ipset '$name'\n";
@@ -2061,7 +2153,7 @@ sub ruleset_chain_add_input_filters {
 	    ruleset_addlog($ruleset, "PVEFW-blacklist", 0, "DROP: ", $loglevel) if $loglevel;
 	    ruleset_addrule($ruleset, "PVEFW-blacklist", "-j DROP");
 	}
-	my $ipset_chain = compute_ipset_chain_name(0, 'blacklist', $ipversion);
+	my $ipset_chain = compute_ipset_name(0, 'blacklist', $ipversion);
 	ruleset_addrule($ruleset, $chain, "-m set --match-set ${ipset_chain} src -j PVEFW-blacklist");
     }
 
@@ -2223,7 +2315,7 @@ sub generate_tap_rules_direction {
     my $tapchain = "$iface-$direction";
 
     my $ipfilter_name = compute_ipfilter_ipset_name($netid);
-    my $ipfilter_ipset = compute_ipset_chain_name($vmid, $ipfilter_name, $ipversion)
+    my $ipfilter_ipset = compute_ipset_name($vmid, $ipfilter_name, $ipversion)
 	if $options->{ipfilter} || $vmfw_conf->{ipset}->{$ipfilter_name};
 
     # create chain with mac and ip filter
@@ -2306,8 +2398,8 @@ sub enable_host_firewall {
 	delete $rule->{iface_in};
     }
 
-    # allow standard traffic for management ipset (includes cluster network)
-    my $mngmnt_ipset_chain = compute_ipset_chain_name(0, "management", $ipversion);
+    # allow standard traffic for mgmt ipset (includes cluster network)
+    my $mngmnt_ipset_chain = compute_ipset_name(0, "mgmt", $ipversion);
     my $mngmntsrc = "-m set --match-set ${mngmnt_ipset_chain} src";
     ruleset_addrule($ruleset, $chain, "$mngmntsrc -p tcp --dport 8006 -j $accept_action");  # PVE API
     ruleset_addrule($ruleset, $chain, "$mngmntsrc -p tcp --dport 5900:5999 -j $accept_action");  # PVE VNC Console
@@ -3177,7 +3269,7 @@ sub generate_ipset_chains {
 	foreach my $ipversion (4, 6) {
 	    my $data = $nethash->{$ipversion};
 
-	    my $name = compute_ipset_chain_name($fw_conf->{vmid}, $ipset, $ipversion);
+	    my $name = compute_ipset_name($fw_conf->{vmid}, $ipset, $ipversion);
 
 	    my $hashsize = scalar(@$options);
 	    if ($hashsize <= 64) {
@@ -3342,7 +3434,7 @@ sub compile {
 	    name => 'local_network', cidr => $localnet, ipversion => $localnet_ver };
     }
 
-    push @{$cluster_conf->{ipset}->{management}}, { cidr => $localnet };
+    push @{$cluster_conf->{ipset}->{mgmt}}, { cidr => $localnet };
 
     my $ruleset = compile_iptables_filter($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, 4, $verbose);
     my $rulesetv6 = compile_iptables_filter($cluster_conf, $hostfw_conf, $vmfw_configs, $vmdata, 6, $verbose);
@@ -3465,7 +3557,7 @@ sub compile_ipsets {
 	    name => 'local_network', cidr => $localnet, ipversion => $localnet_ver };
     }
 
-    push @{$cluster_conf->{ipset}->{management}}, { cidr => $localnet };
+    push @{$cluster_conf->{ipset}->{mgmt}}, { cidr => $localnet };
 
 
     my $ipset_ruleset = {};
@@ -3730,7 +3822,7 @@ sub apply_ruleset {
 
     enable_bridge_firewall();
 
-    my ($ipset_create_cmdlist, $ipset_delete_cmdlist, $ipset_changes) =
+    my ($nfset_create_cmdlist, $nfset_delete_cmdlist, $ipset_changes) =
 	get_ipset_cmdlist($ipset_ruleset, $verbose);
 
     my ($cmdlist, $changes) = get_ruleset_cmdlist($ruleset, $verbose);
@@ -3739,8 +3831,8 @@ sub apply_ruleset {
     if ($verbose) {
 	if ($ipset_changes) {
 	    print "ipset changes:\n";
-	    print $ipset_create_cmdlist if $ipset_create_cmdlist;
-	    print $ipset_delete_cmdlist if $ipset_delete_cmdlist;
+	    print $nfset_create_cmdlist if $nfset_create_cmdlist;
+	    print $nfset_delete_cmdlist if $nfset_delete_cmdlist;
 	}
 
 	if ($changes) {
@@ -3754,25 +3846,20 @@ sub apply_ruleset {
 	}
     }
 
-    my $tmpfile = "$pve_fw_status_dir/ipsetcmdlist1";
-    PVE::Tools::file_set_contents($tmpfile, $ipset_create_cmdlist || '');
+    my $tmpfile = "$pve_fw_status_dir/nfsetcmdlist1";
+    PVE::Tools::file_set_contents($tmpfile, $nfset_create_cmdlist || '');
 
-    ipset_restore_cmdlist($ipset_create_cmdlist);
+    nfset_restore_cmdlist($nfset_create_cmdlist);
 
-    $tmpfile = "$pve_fw_status_dir/ip4cmdlist";
-    PVE::Tools::file_set_contents($tmpfile, $cmdlist || '');
+    $tmpfile = "$pve_fw_status_dir/inetcmdlist";
+    $cmdlist = ($cmdlist||'') . ($cmdlistv6||'');
+    PVE::Tools::file_set_contents($tmpfile, $cmdlist);
+    nftables_restore_cmdlist($cmdlist);
 
-    iptables_restore_cmdlist($cmdlist);
+    $tmpfile = "$pve_fw_status_dir/nfsetcmdlist2";
+    PVE::Tools::file_set_contents($tmpfile, $nfset_delete_cmdlist || '');
 
-    $tmpfile = "$pve_fw_status_dir/ip6cmdlist";
-    PVE::Tools::file_set_contents($tmpfile, $cmdlistv6 || '');
-
-    ip6tables_restore_cmdlist($cmdlistv6);
-
-    $tmpfile = "$pve_fw_status_dir/ipsetcmdlist2";
-    PVE::Tools::file_set_contents($tmpfile, $ipset_delete_cmdlist || '');
-
-    ipset_restore_cmdlist($ipset_delete_cmdlist) if $ipset_delete_cmdlist;
+    nfset_restore_cmdlist($nfset_delete_cmdlist) if $nfset_delete_cmdlist;
 
     # test: re-read status and check if everything is up to date
     my $active_chains = iptables_get_chains();
@@ -3870,9 +3957,9 @@ sub remove_pvefw_chains_iptables {
     $cmdlist .= "COMMIT\n";
 
     if($iptablescmd eq "ip6tables") {
-	ip6tables_restore_cmdlist($cmdlist);
+	nftables_restore_cmdlist($cmdlist);
     } else {
-	iptables_restore_cmdlist($cmdlist);
+	nftables_restore_cmdlist($cmdlist);
     }
 }
 
@@ -3887,7 +3974,7 @@ sub remove_pvefw_chains_ipset {
 	$cmdlist .= "destroy $chain\n";
     }
 
-    ipset_restore_cmdlist($cmdlist) if $cmdlist;
+    nfset_restore_cmdlist($cmdlist) if $cmdlist;
 }
 
 sub init {
